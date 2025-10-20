@@ -18,46 +18,9 @@ from .config import *
 from .mqtt_client import MQTTClient
 from .model_util import ModelUtil, ModelConfig, Model
 from .events import EventQueue
+from .logging import setup_logging, LOG_PATH
 
-# initialize logging: file + console. Use env var ATLANTICO_DEVICE_LOG to override path.
-LOG_PATH = os.environ.get("ATLANTICO_DEVICE_LOG", os.path.join("run", "logs", "device.log"))
-try:
-    os.makedirs(os.path.dirname(LOG_PATH) or ".", exist_ok=True)
-except Exception:
-    # Best effort; if creation fails, fallback to current directory
-    LOG_PATH = os.path.join('.', 'device.log')
-
-# Configure root logger only once to avoid duplicated handlers on reloads
-root_logger = logging.getLogger()
-fmt = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
-# Decide whether to create a dedicated device file handler. By default we
-# avoid creating a file handler so test runs (pytest) that configure a
-# test-scoped log file (tests.log) are the only destination. To force
-# creation of the device file handler (for standalone runs), set
-# ATLANTICO_DEVICE_CREATE_FILE=1 in the environment.
-abs_log_path = os.path.abspath(LOG_PATH)
-create_file = os.environ.get('ATLANTICO_DEVICE_CREATE_FILE', '0') == '1'
-if create_file:
-    has_any_file_handler = any(isinstance(h, logging.FileHandler) for h in root_logger.handlers)
-    if not has_any_file_handler:
-        try:
-            fh = logging.FileHandler(LOG_PATH)
-            fh.setFormatter(fmt)
-            fh.setLevel(logging.INFO)
-            root_logger.addHandler(fh)
-        except Exception:
-            # best-effort: if file handler cannot be created, continue without it
-            pass
-
-# Ensure log level and at least a console StreamHandler exist so test runs
-# output INFO logs when no other handlers were configured by the test harness.
-root_logger.setLevel(logging.INFO)
-has_stream = any(isinstance(h, logging.StreamHandler) for h in root_logger.handlers)
-if not has_stream:
-    ch = logging.StreamHandler()
-    ch.setFormatter(fmt)
-    ch.setLevel(logging.INFO)
-    root_logger.addHandler(ch)
+setup_logging()
 
 _LOG = logging.getLogger(__name__)
 _LOG.info("Logging initialized (file=%s)", LOG_PATH)
@@ -531,6 +494,12 @@ def main():
     args = parser.parse_args()
 
     print("Starting Atlantico device (Raspberry Pi)")
+    # Ensure file+stdout handlers for standalone runs
+    try:
+        setup_logging(force_file=True)
+    except Exception:
+        pass
+
     try:
         setup(connect=args.connect, mqtt_broker=args.broker, device_name=args.device_name)
     except Exception as e:

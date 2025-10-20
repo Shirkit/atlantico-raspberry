@@ -1,5 +1,6 @@
 # Project data / generated (kept as in current .gitignore)
 models/
+*.json
 
 # Local runtime / logs / pid files
 run/pids/

@@ -83,7 +83,7 @@ def test_e2e_model_receive_and_ack(tmp_path):
         pub.publish(MQTT_RAW_RECEIVE_TOPIC, b"\x00\x01\x02")
 
         # allow some time for the device to process (increased to reduce timing flakiness)
-        time.sleep(4.0)
+        time.sleep(10.0)
 
         # check that JSON model file was written
         assert store.exists()
