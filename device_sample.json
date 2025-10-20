@@ -1,0 +1,5 @@
+{
+  "client_id": "atlantico-pi-001",
+  "description": "Example device.json for Raspberry Pi atlantico port",
+  "location": "lab"
+}

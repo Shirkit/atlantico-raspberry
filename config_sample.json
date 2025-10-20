@@ -1,0 +1,1 @@
+{"currentRound": -1, "federateState": "SUBSCRIBED", "modelState": "IDLE", "metrics": {"accuracy": 1.0, "precision": 0.16666666666666666, "recall": 0.16666666666666666, "f1Score": 0.16666666666666666, "mean_squared_error": 2.3036857244729975e-05, "training_time": 1.4097349643707275, "parsing_time": 0}}

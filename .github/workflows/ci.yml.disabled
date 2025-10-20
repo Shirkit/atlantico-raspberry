@@ -1,0 +1,17 @@
+name: CI (disabled)
+
+# This workflow has been intentionally disabled by renaming to
+# `ci.yml.disabled`. To re-enable put the content back into
+# `.github/workflows/ci.yml`.
+
+on:
+  # Disabled on purpose
+  push: []
+  pull_request: []
+
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - name: CI disabled
+        run: echo "CI is disabled in this branch (ci.yml.disabled)"
