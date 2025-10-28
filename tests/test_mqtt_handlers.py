@@ -1,5 +1,6 @@
 import json
 import pytest
+import atlantico_rpi.mqtt_client as mc
 
 from atlantico_rpi.mqtt_client import MQTTClient
 from atlantico_rpi.events import EventQueue
@@ -45,21 +46,9 @@ def test_register_default_handlers_enqueue_events(monkeypatch):
     assert isinstance(ev.payload, dict)
     assert ev.payload['command'] == 'join'
 
-    # simulate a raw model payload on the raw receive topic
-    raw_topic = None
-    for t in client._callbacks:
-        if 'raw' in t:
-            raw_topic = t
-            break
-    assert raw_topic is not None
-    raw_cb = client._callbacks[raw_topic]
-    raw_payload = b"\x00\x01\x02"
-    raw_cb(raw_topic, raw_payload)
-
-    ev2 = q.get(timeout=1.0)
-    assert ev2.name in ('model.raw', 'command.resume.raw')
-    assert isinstance(ev2.payload, dict)
-    assert 'payload' in ev2.payload
+    # default handlers no longer subscribe to raw receive topic
+    raw_cb = client._callbacks.get(mc.MQTT_RAW_RECEIVE_TOPIC)
+    assert raw_cb is None
 import json
 from atlantico_rpi.events import EventQueue
 
@@ -103,11 +92,6 @@ def test_register_default_handlers(monkeypatch):
     assert evt.name == "command.join"
     assert evt.payload["client"] == "pi-test"
 
-    # Simulate raw model payload
+    # The default handler should not register the raw receive callback.
     raw_cb = client._callbacks.get(mc.MQTT_RAW_RECEIVE_TOPIC)
-    assert raw_cb is not None
-    raw_payload = b"\x00\x01\x02"
-    raw_cb(mc.MQTT_RAW_RECEIVE_TOPIC, raw_payload)
-    raw_evt = q.get(timeout=1)
-    assert raw_evt.name == "model.raw"
-    assert raw_evt.payload["payload"] == raw_payload
+    assert raw_cb is None

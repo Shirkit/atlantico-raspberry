@@ -29,8 +29,10 @@ def test_client_specific_raw_enqueue(tmp_path, monkeypatch):
     called = {'enqueued': False}
 
     # register a small callback that uses the default behavior
+    # note: project no longer uses 'model.raw' by default; tests can use
+    # a local event name to validate subscription behavior
     def cb(topic, payload):
-        eq.put('model.raw', {'topic': topic, 'payload': payload})
+        eq.put('model.binary', {'topic': topic, 'payload': payload})
 
     client.subscribe(topic, cb)
 
@@ -41,7 +43,7 @@ def test_client_specific_raw_enqueue(tmp_path, monkeypatch):
 
     ev = eq.try_get()
     assert ev is not None
-    assert ev.name == 'model.raw'
+    assert ev.name == 'model.binary'
     assert isinstance(ev.payload, dict)
     assert ev.payload['topic'] == topic
     assert ev.payload['payload'] == b"\x00\x01\x02"

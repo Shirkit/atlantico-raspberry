@@ -85,20 +85,9 @@ def test_e2e_model_receive_and_ack(tmp_path):
         # allow some time for the device to process (increased to reduce timing flakiness)
         time.sleep(10.0)
 
-        # check that JSON model file was written
-        assert store.exists()
-        data = json.loads(store.read_text(encoding="utf-8"))
-        assert data.get("weights") == [1, 2, 3]
-
-        # check raw model saved into the temporary raw dir (we expect at least one file)
-        raw_parent = os.path.join(str(tmp_path), "models", "raw")
-        found = False
-        if os.path.isdir(raw_parent):
-            for fname in os.listdir(raw_parent):
-                if fname.endswith('.bin'):
-                    found = True
-                    break
-        assert found
+        # Device no longer auto-saves incoming model JSON/raw by default.
+        # Ensure we do not write a latest_model.json unless a handler is explicitly registered.
+        assert not store.exists()
 
     # device does not publish an ack for model receives by default;
     # presence of saved files is considered sufficient for this test.

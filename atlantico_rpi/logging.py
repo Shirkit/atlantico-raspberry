@@ -44,7 +44,12 @@ def setup_logging(force_file: bool = False) -> None:
         try:
             os.makedirs(os.path.dirname(LOG_PATH) or '.', exist_ok=True)
         except Exception:
-            pass
+            # best-effort: log why we couldn't create the directory
+            try:
+                logging.getLogger(__name__).debug("Failed to create log directory for %s", LOG_PATH, exc_info=True)
+            except Exception:
+                # swallow only if logging itself fails
+                pass
         # add file handler if not already present
         if not any(isinstance(h, logging.FileHandler) and getattr(h, 'baseFilename', None) == abs_log_path for h in rl.handlers):
             try:
@@ -53,8 +58,11 @@ def setup_logging(force_file: bool = False) -> None:
                 fh.setLevel(logging.INFO)
                 rl.addHandler(fh)
             except Exception:
-                # best-effort
-                pass
+                # best-effort: log failure to add file handler
+                try:
+                    logging.getLogger(__name__).debug("Failed to add file handler for %s", LOG_PATH, exc_info=True)
+                except Exception:
+                    pass
 
 
 __all__ = ['setup_logging', 'LOG_PATH']

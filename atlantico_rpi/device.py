@@ -1,8 +1,8 @@
-"""High-level device entrypoints (setup/loop) for Raspberry Pi.
+"""Device entrypoints: setup, loop and background model processing.
 
-This module provides minimal wiring between the MQTT background callbacks
-and the main-thread work loop. It keeps the callbacks lightweight by
-enqueuing events into an `EventQueue` and processing them in `loop()`.
+Lightweight glue between MQTT callbacks (which enqueue events) and the
+main-thread event loop that performs small actions and defers heavy work
+to a background worker.
 """
 
 import logging
@@ -13,6 +13,7 @@ from typing import Optional
 import json
 import struct
 import sys
+import threading
 
 from .config import *
 from .mqtt_client import MQTTClient
@@ -25,7 +26,7 @@ setup_logging()
 _LOG = logging.getLogger(__name__)
 _LOG.info("Logging initialized (file=%s)", LOG_PATH)
 
-# module-level singletons created by `setup()` (kept simple for tests)
+# module-level singletons created by `setup()`
 _EVENT_QUEUE: Optional[EventQueue] = None
 _MQTT_CLIENT: Optional[MQTTClient] = None
 _MODEL_UTIL: Optional[ModelUtil] = None
@@ -44,89 +45,117 @@ MODEL_READY_TO_TRAIN = "READY_TO_TRAIN"
 MODEL_BUSY = "MODEL_BUSY"
 MODEL_DONE_TRAINING = "DONE_TRAINING"
 
-# runtime federate state
 _federate_state = FEDERATE_NONE
 _current_round = -1
 _new_model_state = MODEL_IDLE
 _current_model_metrics = None
 _federate_model_config = None
+_PROCESS_THREAD_STARTED = False
+_PROCESS_LOCK = threading.Lock()
 
 
 
 def setup(connect: bool = False, mqtt_broker: Optional[str] = None, model_store_path: str = _MODEL_STORE_PATH, device_name: Optional[str] = None):
-    """Initialize device runtime objects.
+    """Initialize runtime: EventQueue, MQTT client and ModelUtil.
 
-    Args:
-        connect: if True attempt to connect to the MQTT broker immediately.
-        mqtt_broker: optional broker address to pass to the client connect call.
-        model_store_path: path where JSON models (model.json) will be saved.
-
-    Returns: tuple(EventQueue, MQTTClient, ModelUtil)
+    Returns (EventQueue, MQTTClient, ModelUtil). Keep this function fast.
     """
     global _EVENT_QUEUE, _MQTT_CLIENT, _MODEL_UTIL, _MODEL_STORE_PATH
-
     _EVENT_QUEUE = EventQueue()
-    # If caller provided a device_name prefer it when constructing the MQTT client
-    if device_name:
-        _MQTT_CLIENT = MQTTClient(client_id=device_name)
-    else:
-        _MQTT_CLIENT = MQTTClient()
+    _MQTT_CLIENT = MQTTClient(client_id=device_name) if device_name else MQTTClient()
     _MODEL_STORE_PATH = model_store_path
 
-    # register default callbacks so network thread only enqueues light events
     _MQTT_CLIENT.register_default_handlers(_EVENT_QUEUE)
 
-    # create a simple ModelUtil with a conservative config; TF-specific
-    # behaviour will be implemented later in ModelUtil.
     cfg = ModelConfig(layers=[10, 10], activation_functions=[0, 0], epochs=1)
     _MODEL_UTIL = ModelUtil(cfg)
 
-    # attempt to restore previous runtime config (round/federate state)
-    try:
-        if load_device_config():
-            _LOG.info('Loaded device configuration from disk')
-            # if we were training previously, notify server we can resume
-            if _federate_state != FEDERATE_NONE and _current_round != -1:
-                try:
-                    send_command('resume')
-                except Exception:
-                    _LOG.debug('Failed to send resume command during setup')
-    except Exception:
-        _LOG.exception('Error loading device config during setup')
+    if load_device_config():
+        _LOG.info('Loaded device configuration from disk')
+        if _federate_state != FEDERATE_NONE and _current_round != -1:
+            send_command('resume')
 
-    # ensure model directories exist
-    rawdir = os.path.dirname(_RAW_MODEL_DIR)
-    try:
-        os.makedirs(_RAW_MODEL_DIR, exist_ok=True)
-        os.makedirs(os.path.dirname(_MODEL_STORE_PATH) or '.', exist_ok=True)
-    except Exception:
-        _LOG.exception("Failed to create model directories")
+    os.makedirs(_RAW_MODEL_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(_MODEL_STORE_PATH) or '.', exist_ok=True)
 
     if connect:
-        try:
-            # only pass host if explicitly provided, otherwise let MQTTClient use its default
-            if mqtt_broker:
-                _MQTT_CLIENT.connect(host=mqtt_broker)
-            else:
-                _MQTT_CLIENT.connect()
-            _MQTT_CLIENT.loop_start()
-        except Exception:
-            _LOG.exception("Failed to connect to MQTT broker during setup")
+        if mqtt_broker:
+            _MQTT_CLIENT.connect(host=mqtt_broker)
+        else:
+            _MQTT_CLIENT.connect()
+        _MQTT_CLIENT.loop_start()
+
+    global _PROCESS_THREAD_STARTED
+    if not _PROCESS_THREAD_STARTED:
+        t = threading.Thread(target=_process_model_worker, daemon=True)
+        t.start()
+        _PROCESS_THREAD_STARTED = True
+        _LOG.info('Started process_model background worker')
 
     return _EVENT_QUEUE, _MQTT_CLIENT, _MODEL_UTIL
 
 
-def loop(timeout: float = 0.1) -> None:
-    """Main loop: process a single event from queue (non-blocking) and return.
+def start_training_from_config(cfg_local):
+    """Apply federate model config, persist it and mark READY_TO_TRAIN.
 
-    This function is intentionally small so callers can call it frequently.
-    It pulls a single event (if any) and performs a light action: save model
-    files, call ModelUtil stubs (train/predict) and publish minimal acks.
+    Fast-path only: heavy work (training/serialization) runs in the
+    background worker when the state is READY_TO_TRAIN.
     """
+    global _MODEL_UTIL, _federate_model_config, _new_model_state, _federate_state, _current_round
+    try:
+        if isinstance(cfg_local, dict) and cfg_local.get('sendJsonWeights') is True:
+            _LOG.info('start_training_from_config: sendJsonWeights requested; not supported — leaving federation')
+            try:
+                _federate_state = FEDERATE_NONE
+                _current_round = -1
+                save_device_config()
+                try:
+                    send_command('leave')
+                except Exception:
+                    _LOG.debug('Failed to send leave command')
+            except Exception:
+                _LOG.exception('Error while aborting federation for sendJsonWeights')
+            return False
+        # Guard against duplicate starts.
+        if _new_model_state in (MODEL_BUSY, MODEL_READY_TO_TRAIN):
+            _LOG.info('start_training_from_config: model already busy or ready (state=%s); ignoring', _new_model_state)
+            return False
+        # If config is provided, update ModelUtil so training uses correct arch.
+        if cfg_local and isinstance(cfg_local, dict):
+            try:
+                existing_cfg = getattr(_MODEL_UTIL, 'config', None)
+                mc = ModelConfig(
+                    layers=cfg_local.get('layers', getattr(existing_cfg, 'layers', [10, 10])),
+                    activation_functions=cfg_local.get('actvFunctions', cfg_local.get('activation_functions', getattr(existing_cfg, 'activation_functions', [0, 0]))),
+                    epochs=cfg_local.get('epochs', getattr(existing_cfg, 'epochs', 1)),
+                    random_seed=cfg_local.get('randomSeed', getattr(existing_cfg, 'random_seed', 10)),
+                    learning_rate_of_weights=cfg_local.get('learningRateOfWeights', getattr(existing_cfg, 'learning_rate_of_weights', 0.3333)),
+                    learning_rate_of_biases=cfg_local.get('learningRateOfBiases', getattr(existing_cfg, 'learning_rate_of_biases', 0.0666)),
+                    json_weights=cfg_local.get('jsonWeights', getattr(existing_cfg, 'json_weights', False)),
+                )
+                _MODEL_UTIL = ModelUtil(mc)
+            except Exception:
+                _LOG.exception('Failed to apply federate model config; using existing ModelUtil config')
+
+            # remember federate config for diagnostics
+            _federate_model_config = cfg_local
+
+    # Mark model ready; background worker will perform heavy work.
+        _new_model_state = MODEL_READY_TO_TRAIN
+        save_device_config()
+        _LOG.info('Federate setup complete; model marked READY_TO_TRAIN')
+        return True
+    except Exception:
+        _LOG.exception('Failed during federated setup')
+        return False
+
+
+def loop(timeout: float = 0.1) -> None:
+    """Process one queued event (non-blocking) and return quickly."""
     global _EVENT_QUEUE, _MQTT_CLIENT, _MODEL_UTIL, _federate_state, _current_round, _federate_model_config, _current_model_metrics
 
     if _EVENT_QUEUE is None:
-        raise RuntimeError("Device not initialized; call setup() first")
+        raise RuntimeError('Device not initialized; call setup() first')
 
     ev = _EVENT_QUEUE.try_get()
     if ev is None:
@@ -134,182 +163,137 @@ def loop(timeout: float = 0.1) -> None:
         time.sleep(timeout)
         return
 
-    _LOG.info("Handling event %s", ev.name)
+    _LOG.info('Handling event %s', ev.name)
 
     try:
-        if ev.name.startswith("command."):
-            # command payload expected to be a dict that includes 'command' etc.
-            _LOG.info("Received command %s payload=%s", ev.name, ev.payload)
+        # only handle command.* events here; others are ignored quickly
+        if not ev.name.startswith('command.'):
+            _LOG.debug('Unhandled event %s', ev.name)
+            return
+
+        _LOG.info('Received command %s payload=%s', ev.name, ev.payload)
+        data = ev.payload if isinstance(ev.payload, dict) else {}
+        cmd = data.get('command') or ev.name.split('.', 1)[1]
+
+        if cmd in ('join', 'federate_join'):
+            if _federate_state == FEDERATE_NONE:
+                _federate_state = FEDERATE_SUBSCRIBED
+                save_device_config()
+                send_command('join')
+            return
+
+        if cmd in ('federate_unsubscribe', 'leave'):
+            _federate_state = FEDERATE_NONE
+            _current_round = -1
+            save_device_config()
+            send_command('leave')
+            return
+
+        if cmd in ('federate_start', 'start'):
+            cfg = data.get('config')
+            if cfg:
+                _federate_model_config = cfg
+            _federate_state = FEDERATE_TRAINING
+            _current_round = 0
+            save_device_config()
+            send_command('start')
             try:
-                data = ev.payload if isinstance(ev.payload, dict) else {}
-                cmd = data.get('command') or ev.name.split('.', 1)[1]
-                # join -> subscribe to federation
-                if cmd == 'join':
-                    if _federate_state == FEDERATE_NONE:
-                        _federate_state = FEDERATE_SUBSCRIBED
-                        save_device_config()
-                        send_command('join')
-                elif cmd == 'federate_join':
-                    if _federate_state == FEDERATE_NONE:
-                        _federate_state = FEDERATE_SUBSCRIBED
-                        save_device_config()
-                        send_command('join')
-                elif cmd == 'federate_unsubscribe' or cmd == 'leave':
-                    _federate_state = FEDERATE_NONE
-                    _current_round = -1
-                    save_device_config()
-                    send_command('leave')
-                elif cmd == 'federate_start' or cmd == 'start':
-                    # load configuration if present
-                    cfg = data.get('config')
-                    if cfg:
-                        _federate_model_config = cfg
-                    _federate_state = FEDERATE_TRAINING
-                    _current_round = 0
-                    save_device_config()
-                    send_command('federate_start')
-                elif cmd == 'request_model' or cmd == 'request':
-                    # publish current model
-                    try:
-                        cur = None
-                        if _MODEL_UTIL is not None and os.path.exists(_MODEL_STORE_PATH):
-                            cur = _MODEL_UTIL.load_model_from_disk(_MODEL_STORE_PATH)
-                        send_model_to_network(cur, _current_model_metrics, raw_model_path=None)
-                    except Exception:
-                        _LOG.exception('Failed to respond to request_model')
-                elif cmd == 'resume' or cmd == 'federate_resume':
-                    # mark resume requested; server should send raw model next
-                    send_command('resume')
-                else:
-                    # best-effort ack
-                    if _MQTT_CLIENT is not None:
-                        try:
-                            topic = 'atlantico/ack'
-                            payload = json.dumps({'command': cmd, 'status': 'ok'})
-                            _MQTT_CLIENT.publish(topic, payload)
-                        except Exception:
-                            _LOG.debug('Failed to publish ack for command')
-                
+                start_training_from_config(cfg)
             except Exception:
-                _LOG.exception('Error handling command')
+                _LOG.exception('Failed to start federated training setup')
+            return
 
-        elif ev.name == "model.raw":
-            # save raw model bytes to a file for later processing
-            data = ev.payload or {}
-            payload = data.get("payload") if isinstance(data, dict) else None
-            if payload:
-                fname = f"{int(time.time())}-{uuid.uuid4().hex}.bin"
-                path = os.path.join(_RAW_MODEL_DIR, fname)
-                try:
-                    # ensure destination directory exists (tests may override _RAW_MODEL_DIR)
-                    dst_dir = os.path.dirname(path)
-                    if dst_dir and not os.path.exists(dst_dir):
-                        os.makedirs(dst_dir, exist_ok=True)
+        if cmd in ('request_model', 'request'):
+            cur = None
+            if _MODEL_UTIL is not None and os.path.exists(_MODEL_STORE_PATH):
+                cur = _MODEL_UTIL.load_model_from_disk(_MODEL_STORE_PATH)
+            send_model_to_network(cur, _current_model_metrics, raw_model_path=None)
+            return
 
-                    with open(path, "wb") as f:
-                        f.write(payload)
-                    _LOG.info("Saved raw model to %s", path)
-                    # trigger processing: transform bytes -> Model and handle
-                    try:
-                        if _MODEL_UTIL is None:
-                            _LOG.warning('No ModelUtil configured; skipping raw model processing')
-                        else:
-                            m = _MODEL_UTIL.transform_data_to_model(payload)
-                            # persist JSON model derived from raw under the raw models folder
-                            # to avoid clobbering the canonical latest_model.json which may
-                            # have been provided as a JSON model earlier.
-                            raw_json_dir = os.path.dirname(_RAW_MODEL_DIR) or '.'
-                            json_path = os.path.join(raw_json_dir, f"{fname}.json")
-                            _MODEL_UTIL.save_model_to_disk(m, json_path)
-                            # simulate training/publish path
-                            metrics = None
-                            try:
-                                metrics = _MODEL_UTIL.train_model_from_original_dataset(m, X_TRAIN_PATH, Y_TRAIN_PATH)
-                            except Exception:
-                                _LOG.debug('Training skipped or failed (TF may be missing)')
-                            # publish metrics and raw model to network
-                            send_model_to_network(m, metrics, raw_model_path=path)
-                            # decide whether to adopt the new model
-                            try:
-                                if metrics is None:
-                                    _LOG.info('Raw model received but no training metrics available; not adopting automatically')
-                                else:
-                                    if compare_metrics(_current_model_metrics, metrics):
-                                        # accept new model
-                                        _current_model_metrics = metrics
-                                        _MODEL_UTIL.save_model_to_disk(m, _MODEL_STORE_PATH)
-                                        save_device_config()
-                                        _LOG.info('New model accepted and stored as current model')
-                                    else:
-                                        _LOG.info('New model rejected based on metrics comparison')
-                            except Exception:
-                                _LOG.exception('Error while comparing/persisting new model')
-                    except Exception:
-                        _LOG.exception('Failed to process raw model')
-                except Exception:
-                    _LOG.exception("Failed to save raw model")
+        if cmd in ('resume', 'federate_resume'):
+            send_command('resume')
+            return
 
-        elif ev.name == "model.json":
-            # payload is expected to be a dict with model arrays; persist using ModelUtil
-            if _MODEL_UTIL is None:
-                _LOG.warning("No ModelUtil configured; skipping model.json event")
-            else:
-                try:
-                    # attempt to coerce payload -> Model and save
-                    payload = ev.payload if isinstance(ev.payload, dict) else {}
-                    m = Model()
-                    m.biases = payload.get("biases", [])
-                    m.weights = payload.get("weights", [])
-                    m.parsing_time = int(payload.get("parsing_time", 0))
-                    m.round = int(payload.get("round", -1))
-                    _MODEL_UTIL.save_model_to_disk(m, _MODEL_STORE_PATH)
-                    _LOG.info("Saved JSON model to %s", _MODEL_STORE_PATH)
-                    # optionally train and publish
-                    metrics = None
-                    try:
-                        metrics = _MODEL_UTIL.train_model_from_original_dataset(m, X_TRAIN_PATH, Y_TRAIN_PATH)
-                    except Exception:
-                        _LOG.debug('Training skipped or failed (TF may be missing)')
-                    # save a raw representation as well for compatibility (serialize weights to bytes)
-                    try:
-                        raw_path = os.path.join(_RAW_MODEL_DIR, f"{int(time.time())}-{uuid.uuid4().hex}.bin")
-                        os.makedirs(os.path.dirname(raw_path), exist_ok=True)
-                        # naive binary: write biases then weights as float32
-                        with open(raw_path, 'wb') as rf:
-                            for b in (m.biases or []):
-                                rf.write(struct.pack('<f', float(b)))
-                            for w in (m.weights or []):
-                                rf.write(struct.pack('<f', float(w)))
-                        # publish metadata and raw
-                        send_model_to_network(m, metrics, raw_model_path=raw_path)
-                        # compare and possibly accept the new model
-                        try:
-                            if compare_metrics(_current_model_metrics, metrics):
-                                _current_model_metrics = metrics
-                                _MODEL_UTIL.save_model_to_disk(m, _MODEL_STORE_PATH)
-                                save_device_config()
-                                _LOG.info('New JSON model accepted and stored as current model')
-                            else:
-                                _LOG.info('New JSON model rejected based on metrics comparison')
-                        except Exception:
-                            _LOG.exception('Error comparing/persisting JSON model')
-                    except Exception:
-                        _LOG.exception('Failed to write/send raw model from JSON payload')
-                except Exception:
-                    _LOG.exception("Failed to persist JSON model")
+        if cmd in ('alive', 'federate_alive'):
+            send_command('alive')
+            return
 
-        else:
-            _LOG.debug("Unhandled event %s", ev.name)
-
+        _LOG.debug('Unknown command %s', cmd)
     finally:
         try:
             _EVENT_QUEUE.task_done()
         except Exception:
-            pass
+            _LOG.debug('EventQueue.task_done failed', exc_info=True)
+
+
+def _process_model_worker():
+    """Daemon worker: when state==READY_TO_TRAIN it trains and serializes.
+
+    Keeps MQTT thread responsive by doing heavy work off the callback thread.
+    """
+    global _new_model_state, _current_model_metrics, _MODEL_UTIL, _federate_state, _current_round
+    _LOG.info('process_model worker entering loop')
+    while True:
+        try:
+            if _new_model_state != MODEL_READY_TO_TRAIN:
+                time.sleep(0.5)
+                continue
+
+            with _PROCESS_LOCK:
+                if _new_model_state != MODEL_READY_TO_TRAIN:
+                    continue
+                _LOG.info('process_model: detected READY_TO_TRAIN -> starting')
+                _new_model_state = MODEL_BUSY
+                save_device_config()
+
+            if _MODEL_UTIL is None:
+                _LOG.warning('process_model: no ModelUtil configured; skipping training')
+                _new_model_state = MODEL_IDLE
+                save_device_config()
+                time.sleep(0.5)
+                continue
+
+            metrics = _MODEL_UTIL.train_model_from_original_dataset(Model(), X_TRAIN_PATH, Y_TRAIN_PATH)
+            if metrics is None:
+                _LOG.warning('process_model: training returned no metrics')
+                _new_model_state = MODEL_IDLE
+                save_device_config()
+                time.sleep(0.5)
+                continue
+
+            _current_model_metrics = metrics
+            _new_model_state = MODEL_DONE_TRAINING
+            save_device_config()
+            _LOG.info('process_model: training complete (metrics=%s)', getattr(metrics, '__dict__', metrics))
+
+            raw_path = None
+            tf_model = getattr(_MODEL_UTIL, '_last_trained_tf_model', None)
+            if tf_model is not None:
+                raw_bytes = _MODEL_UTIL.serialize_to_nn_bytes(keras_model=tf_model)
+                if raw_bytes:
+                    os.makedirs(_RAW_MODEL_DIR, exist_ok=True)
+                    raw_path = os.path.join(_RAW_MODEL_DIR, f"{int(time.time())}-{uuid.uuid4().hex}.nn")
+                    with open(raw_path, 'wb') as rf:
+                        rf.write(raw_bytes)
+                    _LOG.info('process_model: wrote NN binary to %s', raw_path)
+
+            try:
+                send_model_to_network(None, metrics, raw_model_path=raw_path)
+                _LOG.info('process_model: sent model to network')
+            except Exception:
+                _LOG.exception('process_model: failed to send model to network')
+
+            _new_model_state = MODEL_IDLE
+            save_device_config()
+            _LOG.info('process_model: state set to IDLE')
+            time.sleep(0.5)
+        except Exception:
+            _LOG.exception('process_model worker error')
+            time.sleep(1.0)
 
 
 def send_command(command: str, extra: dict | None = None) -> None:
-    """Send a federate command to the server via MQTT_SEND_COMMANDS_TOPIC."""
+    """Publish a federate command to MQTT_SEND_COMMANDS_TOPIC."""
     global _MQTT_CLIENT
     try:
         payload = {'command': command, 'client': getattr(_MQTT_CLIENT, 'client_id', 'atlantico-pi')}
@@ -324,11 +308,11 @@ def send_command(command: str, extra: dict | None = None) -> None:
         _LOG.exception('Failed to send command')
 
 
-def send_model_to_network(model: Optional[Model], metrics: object, raw_model_path: Optional[str] = None) -> None:
-    """Publish JSON metrics and optionally a raw binary model to MQTT topics.
+def send_model_to_network(model: Optional[Model], metrics: object, raw_model_bytes: Optional[bytes] = None, raw_model_path: Optional[str] = None) -> None:
+    """Publish metrics JSON to MQTT_PUBLISH_TOPIC and raw bytes to raw topic.
 
-    Publishes JSON metadata to `MQTT_PUBLISH_TOPIC` and, if `raw_model_path` is
-    provided, publishes the raw bytes to `MQTT_RAW_PUBLISH_TOPIC/<client>`.
+    JSON contains client, metrics and epochs. Raw bytes are sent to
+    MQTT_RAW_PUBLISH_TOPIC/<client> when available.
     """
     global _MQTT_CLIENT
     try:
@@ -347,30 +331,45 @@ def send_model_to_network(model: Optional[Model], metrics: object, raw_model_pat
                 elif isinstance(metrics, dict) and key in metrics:
                     payload['metrics'][key] = metrics[key]
 
-        # publish JSON metadata
+        # publish JSON metadata (metrics only)
         try:
+            # Publish only metrics and client info on the JSON publish topic.
             topic = MQTT_PUBLISH_TOPIC
+            json_payload = {'client': payload.get('client'), 'metrics': payload.get('metrics', {}), 'epochs': payload.get('epochs', 0)}
             if _MQTT_CLIENT is not None:
-                _MQTT_CLIENT.publish(topic, json.dumps({'data': payload}))
+                _MQTT_CLIENT.publish(topic, json.dumps({'data': json_payload}))
             else:
                 _LOG.debug('MQTT client not initialized; skipping JSON publish')
         except Exception:
             _LOG.exception('Failed to publish JSON model metadata')
 
-        # publish raw model bytes if available
-        if raw_model_path and os.path.exists(raw_model_path):
-            try:
-                with open(raw_model_path, 'rb') as f:
-                    data = f.read()
-                # Publish raw bytes to the canonical raw publish topic (no per-client suffix)
-                # to keep behavior identical to the ESP32 firmware.
+        # publish raw model bytes if available (prefer in-memory bytes)
+        try:
+            data = None
+            if raw_model_bytes:
+                data = raw_model_bytes
+            elif model is not None and _MODEL_UTIL is not None:
+                try:
+                    data = _MODEL_UTIL.serialize_to_nn_bytes(model=model)
+                except Exception:
+                    data = None
+            elif raw_model_path and os.path.exists(raw_model_path):
+                try:
+                    with open(raw_model_path, 'rb') as f:
+                        data = f.read()
+                except Exception:
+                    _LOG.exception('Failed to read raw model from path')
+
+            if data:
                 topic = MQTT_RAW_PUBLISH_TOPIC
+                client_suffix = getattr(_MQTT_CLIENT, 'client_id', None) or 'atlantico-pi'
+                topic = f"{topic}/{client_suffix}"
                 if _MQTT_CLIENT is not None:
                     _MQTT_CLIENT.publish(topic, data)
                 else:
                     _LOG.debug('MQTT client not initialized; skipping raw publish')
-            except Exception:
-                _LOG.exception('Failed to publish raw model bytes')
+        except Exception:
+            _LOG.exception('Failed to publish raw model bytes')
     except Exception:
         _LOG.exception('send_model_to_network failed')
 
@@ -378,32 +377,27 @@ def send_model_to_network(model: Optional[Model], metrics: object, raw_model_pat
 def save_device_config(path: str = CONFIGURATION_PATH) -> bool:
     """Persist minimal device configuration (round, federate state, model state, metrics) to JSON."""
     global _federate_state, _current_round, _new_model_state, _current_model_metrics, _federate_model_config
-    try:
-        payload = {
-            'currentRound': _current_round,
-            'federateState': _federate_state,
-            'modelState': _new_model_state,
-            'metrics': {},
-        }
-        if _current_model_metrics is not None:
-            # try dict-like or object attributes
-            if isinstance(_current_model_metrics, dict):
-                payload['metrics'] = _current_model_metrics
-            else:
-                for key in ('accuracy', 'precision', 'recall', 'f1Score', 'mean_squared_error', 'training_time', 'parsing_time'):
-                    if hasattr(_current_model_metrics, key):
-                        payload['metrics'][key] = getattr(_current_model_metrics, key)
+    payload = {
+        'currentRound': _current_round,
+        'federateState': _federate_state,
+        'modelState': _new_model_state,
+        'metrics': {},
+    }
+    if _current_model_metrics is not None:
+        if isinstance(_current_model_metrics, dict):
+            payload['metrics'] = _current_model_metrics
+        else:
+            for key in ('accuracy', 'precision', 'recall', 'f1Score', 'mean_squared_error', 'training_time', 'parsing_time'):
+                if hasattr(_current_model_metrics, key):
+                    payload['metrics'][key] = getattr(_current_model_metrics, key)
 
-        if _federate_model_config is not None:
-            payload['federateModelConfig'] = _federate_model_config
+    if _federate_model_config is not None:
+        payload['federateModelConfig'] = _federate_model_config
 
-        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(payload, f)
-        return True
-    except Exception:
-        _LOG.exception('Failed to save device config')
-        return False
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f)
+    return True
 
 
 def load_device_config(path: str = CONFIGURATION_PATH) -> bool:
@@ -498,7 +492,7 @@ def main():
     try:
         setup_logging(force_file=True)
     except Exception:
-        pass
+        _LOG.debug('setup_logging(force_file=True) failed', exc_info=True)
 
     try:
         setup(connect=args.connect, mqtt_broker=args.broker, device_name=args.device_name)
