@@ -112,7 +112,21 @@ class MQTTClient:
 
             return _cb
 
+        def make_raw_callback(event_name: str):
+            def _cb(topic: str, payload: bytes):
+                event_queue.put(event_name, {'topic': topic, 'payload': payload})
+
+            return _cb
+
+        # Subscribe to JSON command topic
         self.subscribe(MQTT_RECEIVE_COMMANDS_TOPIC, make_json_callback("command"))
+
+        # Subscribe to raw model receive topic (global)
+        self.subscribe(MQTT_RAW_RECEIVE_TOPIC, make_raw_callback('model.raw'))
+
+        # Subscribe to per-client raw resume topic (client-specific suffix)
+        resume_topic = f"{MQTT_RAW_RESUME_TOPIC}/{self.client_id}"
+        self.subscribe(resume_topic, make_raw_callback('model.rawresume'))
 
     def loop_start(self) -> None:
         """Start the paho network loop in a background thread."""

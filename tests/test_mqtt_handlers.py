@@ -46,9 +46,13 @@ def test_register_default_handlers_enqueue_events(monkeypatch):
     assert isinstance(ev.payload, dict)
     assert ev.payload['command'] == 'join'
 
-    # default handlers no longer subscribe to raw receive topic
+    # default handlers now subscribe to raw receive topic
     raw_cb = client._callbacks.get(mc.MQTT_RAW_RECEIVE_TOPIC)
-    assert raw_cb is None
+    assert raw_cb is not None
+    # also ensure per-client raw resume topic was registered
+    resume_topic = f"{mc.MQTT_RAW_RESUME_TOPIC}/{client.client_id}"
+    resume_cb = client._callbacks.get(resume_topic)
+    assert resume_cb is not None
 import json
 from atlantico_rpi.events import EventQueue
 
@@ -92,6 +96,10 @@ def test_register_default_handlers(monkeypatch):
     assert evt.name == "command.join"
     assert evt.payload["client"] == "pi-test"
 
-    # The default handler should not register the raw receive callback.
+    # The default handler should register the raw receive callback.
     raw_cb = client._callbacks.get(mc.MQTT_RAW_RECEIVE_TOPIC)
-    assert raw_cb is None
+    assert raw_cb is not None
+    # Also ensure per-client raw resume topic was registered
+    resume_topic = f"{mc.MQTT_RAW_RESUME_TOPIC}/{client.client_id}"
+    resume_cb = client._callbacks.get(resume_topic)
+    assert resume_cb is not None

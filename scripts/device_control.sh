@@ -95,5 +95,14 @@ case ${1:-} in
       python3 -m "$DEVICE_MODULE" "$@" 2>&1 | tee "$LOG_FILE"
     fi
     ;;
-  *) echo "Usage: $0 {start|start_background|stop|restart|status|logs|fg} [-- <args passed to module>]"; exit 2 ;;
+  test_train)
+    echo "Running training test script using: ${VENV_PY}"
+    SCRIPT="$REPO_ROOT/scripts/test_train.py"
+    if [ -x "${VENV_PY}" ]; then
+      "${VENV_PY}" "$SCRIPT" "${@:2}"
+    else
+      python3 "$SCRIPT" "${@:2}"
+    fi
+    ;;
+  *) echo "Usage: $0 {start|start_background|stop|restart|status|logs|fg|test_train} [-- <args passed to module>]"; exit 2 ;;
 esac

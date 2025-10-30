@@ -42,6 +42,7 @@ class MultiClassClassifierMetrics:
     parsing_time: float = 0.0
     training_time: float = 0.0
     epochs: int = 0
+    datasetSize: int = 0
 
     accuracy: float = 0.0
     precision: float = 0.0
@@ -162,16 +163,15 @@ class ModelUtil:
         if not os.path.exists(y_path) and os.path.exists(Y_TRAIN_PATH):
             y_path = Y_TRAIN_PATH
 
-        try:
-            X = _load_csv(x_path)
-            y = _load_csv(y_path)
-        except FileNotFoundError:
-            return metrics
+        X = _load_csv(x_path)
+        y = _load_csv(y_path)
 
         if X.ndim == 1:
             X = X.reshape((-1, 1))
         if y.ndim == 1:
             y = y.reshape((-1, 1))
+
+        metrics.datasetSize = int(X.shape[0])
 
         keras = getattr(tf, 'keras', None)
         if keras is None:
@@ -181,11 +181,52 @@ class ModelUtil:
         model_tf = keras.Sequential()
         input_dim = X.shape[1]
         model_tf.add(keras.Input(shape=(input_dim,)))
-        for units in self.config.layers:
-            model_tf.add(keras.layers.Dense(units, activation='relu'))
-        model_tf.add(keras.layers.Dense(y.shape[1], activation='linear'))
 
-        model_tf.compile(optimizer=keras.optimizers.Adam(learning_rate=0.01), loss='mse')
+        # Map numeric activation codes to Keras activations or special markers
+        ACT_MAP = {
+            0: 'sigmoid',
+            1: 'tanh',
+            2: 'relu',
+            3: 'leaky',   # special-case: keras.layers.LeakyReLU
+            4: 'elu',
+            5: 'selu',
+            6: 'softmax',
+        }
+
+        # Determine architecture: accept full-arch (including input) or hidden+output sizes
+        cfg_layers = getattr(self.config, 'layers', None) or []
+        if isinstance(cfg_layers, (list, tuple)) and len(cfg_layers) >= 2:
+            if int(cfg_layers[0]) == int(input_dim):
+                arch = [int(x) for x in cfg_layers]
+            else:
+                arch = [int(input_dim)] + [int(x) for x in cfg_layers]
+        else:
+            arch = [int(input_dim)] + [int(x) for x in (getattr(self.config, 'layers') or [10, 10])]
+
+        act_codes = list(getattr(self.config, 'activation_functions', []) or [])
+        num_dense = len(arch) - 1
+        for i in range(num_dense):
+            units = int(arch[i + 1])
+            code = act_codes[i] if i < len(act_codes) else 2
+            act = ACT_MAP.get(int(code), 'linear')
+
+            # Prefer softmax for final layer when targets are one-hot
+            if i == num_dense - 1 and y.ndim > 1 and y.shape[1] > 1:
+                act = 'softmax'
+
+            if act == 'leaky':
+                model_tf.add(keras.layers.Dense(units))
+                model_tf.add(keras.layers.LeakyReLU(alpha=0.2))
+            else:
+                model_tf.add(keras.layers.Dense(units, activation=act))
+
+        # Choose loss: categorical_crossentropy for one-hot targets, else mse
+        if y.ndim > 1 and y.shape[1] > 1:
+            loss = 'categorical_crossentropy'
+        else:
+            loss = 'mse'
+
+        model_tf.compile(optimizer=keras.optimizers.Adam(learning_rate=0.01), loss=loss)
 
         if hasattr(tf, 'timestamp'):
             start = tf.timestamp()
@@ -206,45 +247,43 @@ class ModelUtil:
 
         metrics.mean_squared_error = float(history.history.get('loss', [0])[-1])
         metrics.meanSqrdError = metrics.mean_squared_error
+
+        # Predictions and classification metrics: convert softmax/prob vectors
+        # to class labels via argmax for multi-class, otherwise threshold.
         preds = model_tf.predict(X)
-        if preds.ndim == 1:
-            preds = preds.reshape((-1, 1))
+        if preds.ndim > 1 and preds.shape[1] > 1:
+            y_pred_labels = np.argmax(preds, axis=1)
+        else:
+            y_pred_labels = (preds.flatten() >= 0.5).astype(int)
 
-        y_bin = (y >= 0.5).astype(int)
-        y_pred_bin = (preds >= 0.5).astype(int)
+        if y.ndim > 1 and y.shape[1] > 1:
+            y_true_labels = np.argmax(y, axis=1)
+        else:
+            y_true_labels = y.flatten().astype(int)
 
-        n_classes = y_bin.shape[1]
+        n_classes = int(max(y_true_labels.max() if y_true_labels.size > 0 else 0,
+                            y_pred_labels.max() if y_pred_labels.size > 0 else 0) + 1)
         metrics.number_of_classes = n_classes
         metrics.metrics = [ClassClassifierMetrics() for _ in range(n_classes)]
 
-        total_tp = total_tn = total_fp = total_fn = 0
-        total_elements = 0
-        mse = 0.0
-        for i in range(y_bin.shape[0]):
+        # confusion counts
+        for i in range(y_true_labels.shape[0]):
+            t = int(y_true_labels[i])
+            p = int(y_pred_labels[i])
             for c in range(n_classes):
-                yt = int(y_bin[i, c])
-                yp = int(y_pred_bin[i, c])
-                total_elements += 1
-                if yt == 1 and yp == 1:
+                if t == c and p == c:
                     metrics.metrics[c].true_positives += 1
-                    total_tp += 1
-                elif yt == 1 and yp == 0:
+                elif t == c and p != c:
                     metrics.metrics[c].false_negatives += 1
-                    total_fn += 1
-                elif yt == 0 and yp == 1:
+                elif t != c and p == c:
                     metrics.metrics[c].false_positives += 1
-                    total_fp += 1
                 else:
                     metrics.metrics[c].true_negatives += 1
-                    total_tn += 1
-            diff = y[i] - preds[i]
-            mse += float((diff ** 2).mean())
 
-        if total_elements > 0:
-            metrics.accuracy = float((total_tp + total_tn) / total_elements)
-        else:
-            metrics.accuracy = 0.0
+        # sample-level accuracy
+        metrics.accuracy = float(np.mean(y_pred_labels == y_true_labels)) if y_true_labels.size > 0 else 0.0
 
+        # per-class precision/recall/f1 and aggregated metrics
         precisions = []
         recalls = []
         f1s = []
@@ -263,8 +302,7 @@ class ModelUtil:
         metrics.recall = float(sum(recalls) / len(recalls)) if recalls else 0.0
         metrics.f1Score = float(sum(f1s) / len(f1s)) if f1s else 0.0
 
-        metrics.mean_squared_error = float(mse / max(1, y.shape[0]))
-        metrics.meanSqrdError = metrics.mean_squared_error
+        # keep mean_squared_error already assigned from training history
         compute_weighted_metrics(metrics)
         return metrics
 
@@ -356,7 +394,6 @@ class ModelUtil:
                 return None
             num_layers = len(layers) - 1
             buf += struct.pack('<I', num_layers)
-
             biases_flat = list(model.biases or [])
             weights_flat = list(model.weights or [])
             b_idx = 0

@@ -152,7 +152,7 @@ def start_training_from_config(cfg_local):
 
 def loop(timeout: float = 0.1) -> None:
     """Process one queued event (non-blocking) and return quickly."""
-    global _EVENT_QUEUE, _MQTT_CLIENT, _MODEL_UTIL, _federate_state, _current_round, _federate_model_config, _current_model_metrics
+    global _EVENT_QUEUE, _MQTT_CLIENT, _MODEL_UTIL, _federate_state, _current_round, _federate_model_config, _current_model_metrics, _new_model_state
 
     if _EVENT_QUEUE is None:
         raise RuntimeError('Device not initialized; call setup() first')
@@ -165,12 +165,30 @@ def loop(timeout: float = 0.1) -> None:
 
     _LOG.info('Handling event %s', ev.name)
 
-    try:
-        # only handle command.* events here; others are ignored quickly
-        if not ev.name.startswith('command.'):
-            _LOG.debug('Unhandled event %s', ev.name)
+    if ev.name.startswith('model.'):
+        payload = ev.payload if isinstance(ev.payload, dict) else {}
+        data_bytes = payload.get('payload') if isinstance(payload, dict) else None
+        if not data_bytes:
+            _LOG.warning('Received model.* event with no payload; ignoring')
             return
 
+        _current_round = int(_current_round) + 1
+        _federate_state = FEDERATE_TRAINING
+
+        os.makedirs(_RAW_MODEL_DIR, exist_ok=True)
+        client_suffix = getattr(_MQTT_CLIENT, 'client_id', 'atlantico-pi')
+        filename = os.path.join(_RAW_MODEL_DIR, f"{_current_round}-{client_suffix}.nn")
+        with open(filename, 'wb') as f:
+            f.write(data_bytes)
+        _LOG.info('Saved received raw model to %s', filename)
+
+        # mark ready to train and persist config — background worker will pick this up
+        _new_model_state = MODEL_READY_TO_TRAIN
+        save_device_config()
+        _LOG.info('Advanced to round %s and marked READY_TO_TRAIN', _current_round)
+        return
+
+    if ev.name.startswith('command.'):
         _LOG.info('Received command %s payload=%s', ev.name, ev.payload)
         data = ev.payload if isinstance(ev.payload, dict) else {}
         cmd = data.get('command') or ev.name.split('.', 1)[1]
@@ -217,13 +235,6 @@ def loop(timeout: float = 0.1) -> None:
         if cmd in ('alive', 'federate_alive'):
             send_command('alive')
             return
-
-        _LOG.debug('Unknown command %s', cmd)
-    finally:
-        try:
-            _EVENT_QUEUE.task_done()
-        except Exception:
-            _LOG.debug('EventQueue.task_done failed', exc_info=True)
 
 
 def _process_model_worker():
@@ -315,63 +326,166 @@ def send_model_to_network(model: Optional[Model], metrics: object, raw_model_byt
     MQTT_RAW_PUBLISH_TOPIC/<client> when available.
     """
     global _MQTT_CLIENT
-    try:
-        payload = {
-            'client': getattr(_MQTT_CLIENT, 'client_id', 'atlantico-pi'),
-            'metrics': {},
-            'model': [],
-            'timings': {},
-            'epochs': getattr(getattr(metrics, 'epochs', None), '__int__', lambda: 0)() if metrics is not None else 0,
-        }
-        # try to include some metrics fields if present
-        if metrics is not None:
-            for key in ('mean_squared_error', 'meanSqrdError', 'accuracy', 'precision', 'recall', 'f1Score', 'training_time', 'parsing_time'):
-                if hasattr(metrics, key):
-                    payload['metrics'][key] = getattr(metrics, key)
-                elif isinstance(metrics, dict) and key in metrics:
-                    payload['metrics'][key] = metrics[key]
+    payload = {
+        'client': getattr(_MQTT_CLIENT, 'client_id', 'atlantico-pi'),
+        'metrics': {},
+        'model': [],
+        'timings': {},
+        'epochs': getattr(getattr(metrics, 'epochs', None), '__int__', lambda: 0)() if metrics is not None else 0,
+    }
+    # try to include some metrics fields if present
+    if metrics is not None:
+        # copy common scalar metrics
+        for key in ('mean_squared_error', 'meanSqrdError', 'accuracy', 'precision', 'recall', 'f1Score', 'training_time', 'parsing_time',
+                    'precision_weighted', 'recall_weighted', 'f1Score_weighted'):
+            if hasattr(metrics, key):
+                payload['metrics'][key] = getattr(metrics, key)
+            elif isinstance(metrics, dict) and key in metrics:
+                payload['metrics'][key] = metrics[key]
 
-        # publish JSON metadata (metrics only)
+        # dataset size
+        ds = None
+        if hasattr(metrics, 'datasetSize'):
+            ds = getattr(metrics, 'datasetSize')
+        elif hasattr(metrics, 'dataset_size'):
+            ds = getattr(metrics, 'dataset_size')
+        elif isinstance(metrics, dict):
+            ds = metrics.get('datasetSize') or metrics.get('dataset_size') or metrics.get('dataset')
+        if ds is not None:
+            payload['metrics']['datasetSize'] = ds
+
+        # per-class confusion arrays if available (metrics.metrics is list of ClassClassifierMetrics)
         try:
-            # Publish only metrics and client info on the JSON publish topic.
-            topic = MQTT_PUBLISH_TOPIC
-            json_payload = {'client': payload.get('client'), 'metrics': payload.get('metrics', {}), 'epochs': payload.get('epochs', 0)}
-            if _MQTT_CLIENT is not None:
-                _MQTT_CLIENT.publish(topic, json.dumps({'data': json_payload}))
-            else:
-                _LOG.debug('MQTT client not initialized; skipping JSON publish')
+            tps = []
+            fps = []
+            tns = []
+            fns = []
+            metrics_list = getattr(metrics, 'metrics', None)
+            if metrics_list:
+                for c in metrics_list:
+                    tps.append(getattr(c, 'true_positives', 0))
+                    fps.append(getattr(c, 'false_positives', 0))
+                    tns.append(getattr(c, 'true_negatives', 0))
+                    fns.append(getattr(c, 'false_negatives', 0))
+            elif isinstance(metrics, dict):
+                # accept dict-style arrays
+                if 'truePositives' in metrics and isinstance(metrics.get('truePositives'), list):
+                    tps = metrics.get('truePositives')
+                    fps = metrics.get('falsePositives', [])
+                    tns = metrics.get('trueNegatives', [])
+                    fns = metrics.get('falseNegatives', [])
+            if tps:
+                payload['metrics']['truePositives'] = tps
+            if fps:
+                payload['metrics']['falsePositives'] = fps
+            if tns:
+                payload['metrics']['trueNegatives'] = tns
+            if fns:
+                payload['metrics']['falseNegatives'] = fns
         except Exception:
-            _LOG.exception('Failed to publish JSON model metadata')
+            _LOG.debug('Failed to extract per-class confusion arrays from metrics', exc_info=True)
 
-        # publish raw model bytes if available (prefer in-memory bytes)
+    # Publish JSON metadata (client, metrics, epochs) and some additional info
+    topic = MQTT_PUBLISH_TOPIC
+    json_payload = {
+        'client': payload.get('client'),
+        'metrics': payload.get('metrics', {}),
+        'epochs': payload.get('epochs', 0),
+    }
+
+    # indicate numeric precision used for metrics (helpful for aggregator)
+    json_payload['precision'] = 'double'
+
+    model_list = None
+    if _federate_model_config and isinstance(_federate_model_config, dict):
+        # common names: 'layers' or 'model'
+        model_list = _federate_model_config.get('layers') or _federate_model_config.get('model')
+
+    # Fall back to ModelUtil config if available
+    if model_list is None and _MODEL_UTIL is not None:
+        cfg = getattr(_MODEL_UTIL, 'config', None)
+        if cfg is not None:
+            model_list = getattr(cfg, 'layers', None) or getattr(cfg, 'model', None)
+
+    if model_list is not None:
+        json_payload['model'] = model_list
+
+    # include number of classes if available
+    if hasattr(metrics, 'number_of_classes'):
         try:
+            json_payload['metrics']['numberOfClasses'] = int(getattr(metrics, 'number_of_classes'))
+        except Exception:
+            pass
+    elif isinstance(metrics, dict) and metrics.get('number_of_classes') is not None:
+        val = metrics.get('number_of_classes')
+        if val is not None:
+            try:
+                json_payload['metrics']['numberOfClasses'] = int(val)
+            except Exception:
+                pass
+
+    metrics_obj = json_payload.get('metrics', {})
+    # dataset size
+    ds = None
+    if isinstance(metrics_obj, dict):
+        ds = metrics_obj.get('datasetSize') or metrics_obj.get('dataset_size') or metrics_obj.get('dataset')
+    else:
+        # metrics may be an object with attributes
+        for attr in ('datasetSize', 'dataset_size', 'dataset'):
+            if hasattr(metrics_obj, attr):
+                ds = getattr(metrics_obj, attr)
+                break
+    if ds is not None:
+        json_payload['datasetSize'] = ds
+
+    # timings
+    timings = None
+    if isinstance(metrics_obj, dict) and 'timings' in metrics_obj:
+        timings = metrics_obj.get('timings')
+    else:
+        # collect common timing fields if present
+        timing_keys = ['training_time', 'parsing_time', 'training', 'parsing', 'previousTransmit', 'previousConstruct']
+        collected = {}
+        for k in timing_keys:
+            if isinstance(metrics_obj, dict) and k in metrics_obj:
+                collected[k] = metrics_obj[k]
+            elif hasattr(metrics_obj, k):
+                collected[k] = getattr(metrics_obj, k)
+        if collected:
+            timings = collected
+
+    if timings is not None:
+        json_payload['timings'] = timings
+
+    if _MQTT_CLIENT is not None:
+        _MQTT_CLIENT.publish(topic, json.dumps(json_payload))
+    else:
+        _LOG.debug('MQTT client not initialized; skipping JSON publish')
+
+    # publish raw model bytes if available (prefer in-memory bytes)
+    data = None
+    if raw_model_bytes:
+        data = raw_model_bytes
+    elif model is not None and _MODEL_UTIL is not None:
+        try:
+            data = _MODEL_UTIL.serialize_to_nn_bytes(model=model)
+        except Exception:
             data = None
-            if raw_model_bytes:
-                data = raw_model_bytes
-            elif model is not None and _MODEL_UTIL is not None:
-                try:
-                    data = _MODEL_UTIL.serialize_to_nn_bytes(model=model)
-                except Exception:
-                    data = None
-            elif raw_model_path and os.path.exists(raw_model_path):
-                try:
-                    with open(raw_model_path, 'rb') as f:
-                        data = f.read()
-                except Exception:
-                    _LOG.exception('Failed to read raw model from path')
-
-            if data:
-                topic = MQTT_RAW_PUBLISH_TOPIC
-                client_suffix = getattr(_MQTT_CLIENT, 'client_id', None) or 'atlantico-pi'
-                topic = f"{topic}/{client_suffix}"
-                if _MQTT_CLIENT is not None:
-                    _MQTT_CLIENT.publish(topic, data)
-                else:
-                    _LOG.debug('MQTT client not initialized; skipping raw publish')
+    elif raw_model_path and os.path.exists(raw_model_path):
+        try:
+            with open(raw_model_path, 'rb') as f:
+                data = f.read()
         except Exception:
-            _LOG.exception('Failed to publish raw model bytes')
-    except Exception:
-        _LOG.exception('send_model_to_network failed')
+            _LOG.exception('Failed to read raw model from path')
+
+    if data:
+        topic = MQTT_RAW_PUBLISH_TOPIC
+        client_suffix = getattr(_MQTT_CLIENT, 'client_id', None) or 'atlantico-pi'
+        topic = f"{topic}/{client_suffix}"
+        if _MQTT_CLIENT is not None:
+            _MQTT_CLIENT.publish(topic, data)
+        else:
+            _LOG.debug('MQTT client not initialized; skipping raw publish')
 
 
 def save_device_config(path: str = CONFIGURATION_PATH) -> bool:
