@@ -28,19 +28,19 @@ class Model:
 
 @dataclass
 class ClassClassifierMetrics:
-    true_positives: int = 0
-    true_negatives: int = 0
-    false_positives: int = 0
-    false_negatives: int = 0
+    truePositives: int = 0
+    trueNegatives: int = 0
+    falsePositives: int = 0
+    falseNegatives: int = 0
 
 
 @dataclass
 class MultiClassClassifierMetrics:
     metrics: Optional[List[ClassClassifierMetrics]] = None
-    number_of_classes: int = 0
-    mean_squared_error: float = 0.0
-    parsing_time: float = 0.0
-    training_time: float = 0.0
+    numberOfClasses: int = 0
+    meanSqrdError: float = 0.0
+    parsingTime: float = 0.0
+    trainingTime: float = 0.0
     epochs: int = 0
     datasetSize: int = 0
 
@@ -48,10 +48,9 @@ class MultiClassClassifierMetrics:
     precision: float = 0.0
     recall: float = 0.0
     f1Score: float = 0.0
-    meanSqrdError: float = 0.0
-    precision_weighted: float = 0.0
-    recall_weighted: float = 0.0
-    f1Score_weighted: float = 0.0
+    precisionWeighted: float = 0.0
+    recallWeighted: float = 0.0
+    f1ScoreWeighted: float = 0.0
 
 
 class ModelConfig:
@@ -79,7 +78,7 @@ class ModelUtil:
         payload = {
             "biases": model.biases if model.biases is not None else [],
             "weights": model.weights if model.weights is not None else [],
-            "parsing_time": int(model.parsing_time),
+            "parsingTime": int(model.parsing_time),
             "round": int(model.round),
         }
         dirpath = os.path.dirname(file_path)
@@ -97,7 +96,7 @@ class ModelUtil:
         m = Model()
         m.biases = data.get("biases", [])
         m.weights = data.get("weights", [])
-        m.parsing_time = int(data.get("parsing_time", 0))
+        m.parsing_time = int(data.get("parsingTime", 0))
         m.round = int(data.get("round", -1))
         return m
 
@@ -110,7 +109,7 @@ class ModelUtil:
             m = Model()
             m.biases = stream.get("biases", [])
             m.weights = stream.get("weights", [])
-            m.parsing_time = int(stream.get("parsing_time", 0))
+            m.parsing_time = int(stream.get("parsingTime", 0))
             m.round = int(stream.get("round", -1))
             return m
 
@@ -135,7 +134,7 @@ class ModelUtil:
                     weights.extend(w)
             m.biases = biases
             m.weights = weights
-            m.parsing_time = int(parsed.get('parsing_time', 0))
+            m.parsing_time = int(parsed.get('parsingTime', 0))
             m.round = int(parsed.get('round', -1))
             return m
 
@@ -144,8 +143,8 @@ class ModelUtil:
     def train_model_from_original_dataset(self, model: Model, x_file: str, y_file: str) -> MultiClassClassifierMetrics:
         """Train a model using files `x_file` and `y_file`. Returns metrics."""
         metrics = MultiClassClassifierMetrics()
-        metrics.parsing_time = 0
-        metrics.training_time = 0
+        metrics.parsingTime = 0
+        metrics.trainingTime = 0
         metrics.epochs = self.config.epochs
 
         if tf is None:
@@ -170,6 +169,28 @@ class ModelUtil:
             X = X.reshape((-1, 1))
         if y.ndim == 1:
             y = y.reshape((-1, 1))
+
+        # Ensure X and y have the same number of samples. If files differ
+        # (for example due to trailing newlines or pre-processing issues),
+        # trim to the smaller set and log a warning so the caller can
+        # investigate. Avoid raising here to keep training robust on-device.
+        try:
+            n_x = int(X.shape[0])
+        except Exception:
+            n_x = 0
+        try:
+            n_y = int(y.shape[0])
+        except Exception:
+            n_y = 0
+
+        if n_x != n_y:
+            _LOG.warning('Data cardinality mismatch: x samples=%s, y samples=%s — trimming to min', n_x, n_y)
+            m = min(n_x, n_y)
+            if m <= 0:
+                _LOG.error('No samples available after trimming (x=%s, y=%s); aborting training', n_x, n_y)
+                return metrics
+            X = X[:m]
+            y = y[:m]
 
         metrics.datasetSize = int(X.shape[0])
 
@@ -202,6 +223,24 @@ class ModelUtil:
                 arch = [int(input_dim)] + [int(x) for x in cfg_layers]
         else:
             arch = [int(input_dim)] + [int(x) for x in (getattr(self.config, 'layers') or [10, 10])]
+
+        # If targets are provided as one-hot vectors, ensure the final
+        # layer's number of outputs matches the number of classes. This
+        # prevents Keras from raising a shape mismatch when using
+        # categorical_crossentropy.
+        if y.ndim > 1 and y.shape[1] > 1:
+            try:
+                required_outputs = int(y.shape[1])
+                if arch[-1] != required_outputs:
+                    _LOG.info(
+                        "Adjusting final layer units from %s to %s to match one-hot targets",
+                        arch[-1], required_outputs,
+                    )
+                    arch[-1] = required_outputs
+            except Exception:
+                # If anything goes wrong determining output size, prefer
+                # to continue and let Keras raise an explicit error later.
+                pass
 
         act_codes = list(getattr(self.config, 'activation_functions', []) or [])
         num_dense = len(arch) - 1
@@ -240,13 +279,12 @@ class ModelUtil:
         else:
             end = time.time()
 
-        metrics.training_time = float(end - start)
+        metrics.trainingTime = float(end - start)
 
         # Intentionally let assignment failures surface.
         self._last_trained_tf_model = model_tf
 
-        metrics.mean_squared_error = float(history.history.get('loss', [0])[-1])
-        metrics.meanSqrdError = metrics.mean_squared_error
+        metrics.meanSqrdError = float(history.history.get('loss', [0])[-1])
 
         # Predictions and classification metrics: convert softmax/prob vectors
         # to class labels via argmax for multi-class, otherwise threshold.
@@ -263,7 +301,7 @@ class ModelUtil:
 
         n_classes = int(max(y_true_labels.max() if y_true_labels.size > 0 else 0,
                             y_pred_labels.max() if y_pred_labels.size > 0 else 0) + 1)
-        metrics.number_of_classes = n_classes
+        metrics.numberOfClasses = n_classes
         metrics.metrics = [ClassClassifierMetrics() for _ in range(n_classes)]
 
         # confusion counts
@@ -272,13 +310,13 @@ class ModelUtil:
             p = int(y_pred_labels[i])
             for c in range(n_classes):
                 if t == c and p == c:
-                    metrics.metrics[c].true_positives += 1
+                    metrics.metrics[c].truePositives += 1
                 elif t == c and p != c:
-                    metrics.metrics[c].false_negatives += 1
+                    metrics.metrics[c].falseNegatives += 1
                 elif t != c and p == c:
-                    metrics.metrics[c].false_positives += 1
+                    metrics.metrics[c].falsePositives += 1
                 else:
-                    metrics.metrics[c].true_negatives += 1
+                    metrics.metrics[c].trueNegatives += 1
 
         # sample-level accuracy
         metrics.accuracy = float(np.mean(y_pred_labels == y_true_labels)) if y_true_labels.size > 0 else 0.0
@@ -288,9 +326,9 @@ class ModelUtil:
         recalls = []
         f1s = []
         for c in range(n_classes):
-            tp = metrics.metrics[c].true_positives
-            fp = metrics.metrics[c].false_positives
-            fn = metrics.metrics[c].false_negatives
+            tp = metrics.metrics[c].truePositives
+            fp = metrics.metrics[c].falsePositives
+            fn = metrics.metrics[c].falseNegatives
             prec = (tp / (tp + fp)) if (tp + fp) > 0 else 0.0
             rec = (tp / (tp + fn)) if (tp + fn) > 0 else 0.0
             f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
@@ -479,7 +517,7 @@ class ModelUtil:
 
 def compute_weighted_metrics(metrics: MultiClassClassifierMetrics) -> None:
     """Compute support-weighted precision/recall/f1 in-place."""
-    if metrics is None or metrics.metrics is None or metrics.number_of_classes == 0:
+    if metrics is None or metrics.metrics is None or metrics.numberOfClasses == 0:
         return
 
     supports = []
@@ -487,11 +525,11 @@ def compute_weighted_metrics(metrics: MultiClassClassifierMetrics) -> None:
     recalls = []
     f1s = []
     total_support = 0
-    for c in range(metrics.number_of_classes):
+    for c in range(metrics.numberOfClasses):
         m = metrics.metrics[c]
-        tp = m.true_positives
-        fp = m.false_positives
-        fn = m.false_negatives
+        tp = m.truePositives
+        fp = m.falsePositives
+        fn = m.falseNegatives
         support = tp + fn
         supports.append(support)
         total_support += support
@@ -507,11 +545,11 @@ def compute_weighted_metrics(metrics: MultiClassClassifierMetrics) -> None:
     metrics.f1Score = float(sum(f1s) / len(f1s)) if f1s else 0.0
 
     if total_support > 0:
-        metrics.precision_weighted = float(sum(p * s for p, s in zip(precisions, supports)) / total_support)
-        metrics.recall_weighted = float(sum(r * s for r, s in zip(recalls, supports)) / total_support)
-        metrics.f1Score_weighted = float(sum(f * s for f, s in zip(f1s, supports)) / total_support)
+        metrics.precisionWeighted = float(sum(p * s for p, s in zip(precisions, supports)) / total_support)
+        metrics.recallWeighted = float(sum(r * s for r, s in zip(recalls, supports)) / total_support)
+        metrics.f1ScoreWeighted = float(sum(f * s for f, s in zip(f1s, supports)) / total_support)
     else:
-        metrics.precision_weighted = metrics.precision
-        metrics.recall_weighted = metrics.recall
-        metrics.f1Score_weighted = metrics.f1Score
+        metrics.precisionWeighted = metrics.precision
+        metrics.recallWeighted = metrics.recall
+        metrics.f1ScoreWeighted = metrics.f1Score
 

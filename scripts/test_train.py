@@ -20,12 +20,26 @@ from atlantico_rpi.model_util import ModelConfig, ModelUtil, Model
 
 
 def metrics_to_dict(metrics):
-    d = {k: getattr(metrics, k) for k in ['number_of_classes', 'mean_squared_error', 'parsing_time', 'training_time', 'epochs', 'accuracy', 'precision', 'recall', 'f1Score', 'meanSqrdError', 'precision_weighted', 'recall_weighted', 'f1Score_weighted']}
+    # Export a compact dict using camelCase field names only.
+    d = {
+        'numberOfClasses': getattr(metrics, 'numberOfClasses', None),
+        'meanSqrdError': getattr(metrics, 'meanSqrdError', None),
+        'parsingTime': getattr(metrics, 'parsingTime', None),
+        'trainingTime': getattr(metrics, 'trainingTime', None),
+        'epochs': getattr(metrics, 'epochs', None),
+        'accuracy': getattr(metrics, 'accuracy', None),
+        'precision': getattr(metrics, 'precision', None),
+        'recall': getattr(metrics, 'recall', None),
+        'f1Score': getattr(metrics, 'f1Score', None),
+        'precisionWeighted': getattr(metrics, 'precisionWeighted', None),
+        'recallWeighted': getattr(metrics, 'recallWeighted', None),
+        'f1ScoreWeighted': getattr(metrics, 'f1ScoreWeighted', None),
+    }
     mm = []
     if getattr(metrics, 'metrics', None):
         for c in metrics.metrics:
-            mm.append({'true_positives': c.true_positives, 'true_negatives': c.true_negatives, 'false_positives': c.false_positives, 'false_negatives': c.false_negatives})
-    d['per_class'] = mm
+            mm.append({'truePositives': c.truePositives, 'trueNegatives': c.trueNegatives, 'falsePositives': c.falsePositives, 'falseNegatives': c.falseNegatives})
+    d['perClass'] = mm
     return d
 
 

@@ -5,15 +5,15 @@ from atlantico_rpi.device import compare_metrics
 def make_metrics(tp_fp_fn_tuples):
     # tp_fp_fn_tuples: list of (tp, fp, fn, tn)
     metrics = MultiClassClassifierMetrics()
-    metrics.number_of_classes = len(tp_fp_fn_tuples)
+    metrics.numberOfClasses = len(tp_fp_fn_tuples)
     metrics.metrics = []
     total = 0
     for tp, fp, fn, tn in tp_fp_fn_tuples:
         m = ClassClassifierMetrics()
-        m.true_positives = tp
-        m.false_positives = fp
-        m.false_negatives = fn
-        m.true_negatives = tn
+        m.truePositives = tp
+        m.falsePositives = fp
+        m.falseNegatives = fn
+        m.trueNegatives = tn
         metrics.metrics.append(m)
         total += tp + tn + fp + fn
     # if no samples, leave accuracy 0
@@ -29,9 +29,9 @@ def test_weighted_metrics_simple_case():
     assert m.precision >= 0.0
     assert m.recall >= 0.0
     assert m.f1Score >= 0.0
-    assert m.precision_weighted >= 0.0
-    assert m.recall_weighted >= 0.0
-    assert m.f1Score_weighted >= 0.0
+    assert m.precisionWeighted >= 0.0
+    assert m.recallWeighted >= 0.0
+    assert m.f1ScoreWeighted >= 0.0
 
 
 def test_compare_metrics_prefers_better_model():
