@@ -581,16 +581,7 @@ def save_device_config(path: str = CONFIGURATION_PATH) -> bool:
         'currentRound': _current_round,
         'federateState': _federate_state,
         'modelState': _new_model_state,
-        'metrics': {},
     }
-    if _current_model_metrics is not None:
-        if isinstance(_current_model_metrics, dict):
-            payload['metrics'] = _current_model_metrics
-        else:
-            for key in ('accuracy', 'precision', 'recall', 'f1Score', 'meanSqrdError', 'trainingTime', 'parsingTime',
-                        'precisionWeighted', 'recallWeighted', 'f1ScoreWeighted'):
-                if hasattr(_current_model_metrics, key):
-                    payload['metrics'][key] = getattr(_current_model_metrics, key)
 
     if _federate_model_config is not None:
         payload['federateModelConfig'] = _federate_model_config
@@ -614,8 +605,6 @@ def load_device_config(path: str | None = None) -> bool:
         _current_round = data.get('currentRound', -1)
         _federate_state = data.get('federateState', FEDERATE_NONE)
         _new_model_state = data.get('modelState', MODEL_IDLE)
-        metrics = data.get('metrics', {})
-        _current_model_metrics = metrics
         _federate_model_config = data.get('federateModelConfig')
         return True
     except Exception:

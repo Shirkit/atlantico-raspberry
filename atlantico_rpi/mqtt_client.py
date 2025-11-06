@@ -22,7 +22,7 @@ class MQTTClient:
             if os.path.exists(device_json_path):
                 with open(device_json_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    for key in ("client_id", "client_name", "device_id", "name"):
+                    for key in ("client", "client_name"):
                         if key in data and isinstance(data[key], str) and data[key].strip():
                             resolved_client_id = data[key].strip()
                             break
