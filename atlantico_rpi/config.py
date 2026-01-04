@@ -28,3 +28,5 @@ MQTT_RECEIVE_COMMANDS_TOPIC = "esp32/fl/commands/pull"
 MQTT_SEND_COMMANDS_TOPIC = "esp32/fl/commands/push"
 
 CONNECTION_TIMEOUT = 30000  # milliseconds
+
+DISABLE_FEDERATION = False

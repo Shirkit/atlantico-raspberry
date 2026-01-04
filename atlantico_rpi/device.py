@@ -198,6 +198,10 @@ def loop(timeout: float = 0.1) -> None:
     _LOG.info('Handling event %s', ev.name)
 
     if ev.name.startswith('model.'):
+        if _cfg.DISABLE_FEDERATION:
+            _LOG.debug('Ignoring model update - federation disabled')
+            return
+        
         payload = ev.payload if isinstance(ev.payload, dict) else {}
         data_bytes = payload.get('payload') if isinstance(payload, dict) else None
         if not data_bytes:
@@ -226,6 +230,8 @@ def loop(timeout: float = 0.1) -> None:
         cmd = data.get('command') or ev.name.split('.', 1)[1]
 
         if cmd in ('join', 'federate_join'):
+            if _cfg.DISABLE_FEDERATION:
+                return
             if _federate_state == FEDERATE_NONE:
                 _federate_state = FEDERATE_SUBSCRIBED
                 save_device_config()
@@ -233,6 +239,8 @@ def loop(timeout: float = 0.1) -> None:
             return
 
         if cmd in ('federate_unsubscribe', 'leave'):
+            if _cfg.DISABLE_FEDERATION:
+                return
             _federate_state = FEDERATE_NONE
             _current_round = -1
             save_device_config()
@@ -240,6 +248,8 @@ def loop(timeout: float = 0.1) -> None:
             return
 
         if cmd in ('federate_start', 'start'):
+            if _cfg.DISABLE_FEDERATION:
+                return
             cfg = data.get('config')
             if cfg:
                 _federate_model_config = cfg
@@ -261,6 +271,8 @@ def loop(timeout: float = 0.1) -> None:
             return
 
         if cmd in ('resume', 'federate_resume'):
+            if _cfg.DISABLE_FEDERATION:
+                return
             send_command('resume')
             return
 
@@ -672,11 +684,12 @@ def main():
     import sys
 
     parser = argparse.ArgumentParser(description="Atlantico device runtime")
-    parser.add_argument("--connect", action="store_true", help="Connect to MQTT broker during setup")
-    parser.add_argument("--broker", default=None, help="MQTT broker address (overrides config)")
+    parser.add_argument("--offline", action="store_true", help="Doesn't connect to MQTT broker during setup")
+    parser.add_argument("--broker", "-b", default=None, help="MQTT broker address (overrides config)")
     parser.add_argument("--device-name", "-n", default=None, help="Override the MQTT client/device name")
     parser.add_argument("--run-for", type=float, default=0.0, help="Run for N seconds then exit (0 = forever)")
     parser.add_argument("--data-dir", type=str, default=None, help="Optional data directory with x_train.csv, y_train.csv, config.json and device.json")
+    parser.add_argument("--no-federation", action="store_true", default=False, help="Disable join in federation")
     args = parser.parse_args()
 
     print("Starting Atlantico device (Raspberry Pi)")
@@ -715,6 +728,8 @@ def main():
         except Exception:
             _LOG.exception('Failed to set module-level config path globals for data-dir')
 
+    _cfg.DISABLE_FEDERATION = args.no_federation
+
     # If device-name wasn't passed explicitly, try to read it from device.json
     inferred_device_name = None
     if not args.device_name:
@@ -734,7 +749,7 @@ def main():
     # prefer explicit CLI override, otherwise use inferred device name if available
     device_name_to_use = args.device_name or inferred_device_name
     try:
-        setup(connect=args.connect, mqtt_broker=args.broker, device_name=device_name_to_use)
+        setup(connect=not args.offline, mqtt_broker=args.broker, device_name=device_name_to_use)
     except Exception as e:
         print("Failed to initialize device:", e)
         return
